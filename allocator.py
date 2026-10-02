@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """不理解源语言语义的寄存器分配器。
 
-输入 JSON 的结构见 README.md。分配器只使用每条指令声明的 reads / defines：
+输入 JSON 的结构见 README.md。分配器只使用每条指令声明的 reads / defines /
+clobbers 以及变量的寄存器域、固定寄存器和带权亲和提示：
 
 1. 在可能带循环的 CFG 上做活跃变量数据流不动点；
-2. 自底向上扫描各块，建立临时变量之间的干涉图；
-3. 枚举至多 2^12 个溢出集合，并用带前向检查的回溯做合法着色；
-4. 按「总溢出代价、排序后的溢出变量序列、寄存器映射字典序」选择唯一答案。
+2. 自底向上扫描各块，建立临时变量之间的干涉图，并按「读取→改写→定义」的
+   时序累计每个变量必须避开的调用改写寄存器；
+3. 枚举至多 2^12 个溢出集合，并用带前向检查的回溯做合法着色；着色同时满足
+   干涉、固定寄存器与调用改写限制三类硬约束；
+4. 按「总溢出代价、已满足亲和权重总和（越大越优）、排序后的溢出变量序列、
+   寄存器映射字典序」选择唯一答案。
 """
 
 from __future__ import annotations
@@ -263,8 +267,17 @@ def build_interference(
     variables: dict[str, dict[str, Any]],
     blocks: list[dict[str, Any]],
     live_out: dict[str, set[str]],
-) -> dict[str, set[str]]:
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """建立干涉图，并计算调用改写寄存器对每个变量的限制。
+
+    返回 (干涉图, register_restrictions)。register_restrictions[v] 是
+    所有「v 的活跃区间跨越该调用点」的 clobbers 的并集：指令读取发生在改写前、
+    定义发生在改写后，所以仅在本指令读取后死亡的变量、以及本指令新定义的变量
+    都不算跨越调用点，只有 live_after − {defines} 中的变量必须避开这些寄存器。
+    多个调用点的限制取并集，变量因此同时避开它所跨越的全部调用。
+    """
     graph = {variable_id: set() for variable_id in variables}
+    restrictions = {variable_id: set() for variable_id in variables}
 
     def add_edge(left: str, right: str) -> None:
         if left == right:
@@ -279,6 +292,17 @@ def build_interference(
         # 与本指令新定义的变量不发生干涉，因而可以复用同一寄存器。
         for instruction in reversed(block["instructions"]):
             defined = instruction["defines"]
+            clobbers = set(instruction["clobbers"])
+
+            # live 此刻恰为 live_after(指令)。本指令读取在改写前已完成、
+            # 本指令的定义在改写后才产生，二者都无需避开 clobbers；
+            # 其余 live 变量必须活着穿越整条指令，不能停在被改写寄存器里。
+            survivors = set(live)
+            if defined is not None:
+                survivors.discard(defined)
+            for variable in survivors:
+                restrictions[variable].update(clobbers)
+
             if defined is not None:
                 for other in sorted(live):
                     add_edge(defined, other)
@@ -290,7 +314,7 @@ def build_interference(
                     add_edge(variable, other)
                 live.add(variable)
 
-    return graph
+    return graph, restrictions
 
 
 def interference_edges(graph: dict[str, set[str]]) -> list[list[str]]:
@@ -310,22 +334,89 @@ def color_without_spills(
     variables: dict[str, dict[str, Any]],
     graph: dict[str, set[str]],
     spilled: set[str],
-) -> Optional[dict[str, str]]:
-    """对未溢出变量找字典序最小的合法寄存器映射；不存在则返回 None。"""
+    restrictions: Optional[dict[str, set[str]]] = None,
+) -> Optional[tuple[dict[str, str], int]]:
+    """对未溢出变量找合法着色。
+
+    硬约束有三类：
+    - 干涉变量不能同寄存器；
+    - pinned_register 固定的变量只能取该寄存器（无法满足时该变量必须被溢出，
+      由外层枚举溢出集合处理）；
+    - 活跃区间跨越调用点的变量不能取该调用 clobbers 中的寄存器。
+
+    对给定溢出集合，先最大化已满足亲和提示（prefer_same_as 与对方同色）的
+    权重总和；收益相同时，寄存器仍按名称字典序枚举，搜索按变量 ID 字典序
+    推进，因此第一个最优解就是字典序最小的合法映射。不存在合法着色时返回 None。
+    """
+    if restrictions is None:
+        restrictions = {variable_id: set() for variable_id in variables}
+
     order = sorted(variable_id for variable_id in variables if variable_id not in spilled)
     colors: dict[str, str] = {}
 
+    # 只统计两端都未溢出的亲和提示；任何一端被溢出都不可能满足。
+    active_edges: list[tuple[str, str, int]] = []
+    for variable_id in order:
+        partner = variables[variable_id]["prefer_same_as"]
+        if partner is not None and partner not in spilled:
+            active_edges.append(
+                (variable_id, partner, variables[variable_id]["affinity_weight"])
+            )
+
     def available_colors(variable_id: str) -> list[str]:
+        info = variables[variable_id]
+        pinned = info["pinned_register"]
+        pool = [pinned] if pinned is not None else sorted(info["registers"])
         used = {colors[neighbor] for neighbor in graph[variable_id] if neighbor in colors}
+        forbidden = restrictions.get(variable_id, set())
         return [
             register
-            for register in sorted(variables[variable_id]["registers"])
-            if register not in used
+            for register in pool
+            if register not in used and register not in forbidden
         ]
 
-    def search(index: int) -> Optional[dict[str, str]]:
+    def affinity_delta(variable_id: str, register: str) -> int:
+        """本变量着色时恰好定局的亲和权重。
+
+        一条亲和边在两端中较晚上色的变量被赋值时结算一次：不管它是发起方
+        还是伙伴方，只要先着色的另一端颜色相同就计入收益。
+        """
+        gain = 0
+        for source, partner, weight in active_edges:
+            if variable_id == source:
+                if colors.get(partner) == register:
+                    gain += weight
+            elif variable_id == partner and source in colors:
+                if colors[source] == register:
+                    gain += weight
+        return gain
+
+    best_gain: Optional[int] = None
+    best_coloring: Optional[dict[str, str]] = None
+
+    def search(index: int, gain: int) -> None:
+        nonlocal best_gain, best_coloring
+
+        # 亲和边在两端中较晚着色的变量赋值时结算：只要还有至少一端未着色，
+        # 该提示就仍可能被满足（潜在权重 = 自身权重，与选择路径无关）。
+        # 发起方已定且与伙伴当时颜色不同会失去收益，但那会立即在伙伴着色时
+        # 反映到 gain 里；这里用「仍未定局的边」求和作为可纳上界。
+        if best_gain is not None:
+            pending = 0
+            for source, partner, weight in active_edges:
+                if source not in colors or partner not in colors:
+                    pending += weight
+            # 上界不超过已找到的最优即可剪枝：严格小于无法反超；等于时也无需探索，
+            # 合法完整解按变量 ID、再按寄存器名的字典序依次到达（前向检查只剪掉
+            # 无解分支），已记录的同收益解必然字典序更靠前。
+            if gain + pending <= best_gain:
+                return
+
         if index == len(order):
-            return dict(colors)
+            if best_gain is None or gain > best_gain:
+                best_gain = gain
+                best_coloring = dict(colors)
+            return
 
         variable_id = order[index]
         candidates = available_colors(variable_id)
@@ -342,25 +433,31 @@ def color_without_spills(
                         break
 
             if feasible:
-                result = search(index + 1)
-                if result is not None:
-                    return result
+                search(index + 1, gain + affinity_delta(variable_id, register))
 
         colors.pop(variable_id, None)
-        return None
 
-    return search(0)
+    search(0, 0)
+    if best_coloring is None:
+        return None
+    return best_coloring, best_gain or 0
 
 
 def choose_allocation(
     variables: dict[str, dict[str, Any]],
     graph: dict[str, set[str]],
-) -> tuple[set[str], dict[str, str], int]:
+    restrictions: dict[str, set[str]],
+) -> tuple[set[str], dict[str, str], int, int]:
     variable_ids = sorted(variables)
-    best_key: Optional[tuple[int, tuple[str, ...], tuple[tuple[str, str], ...]]] = None
+    # 裁决顺序：溢出代价最小 → 已满足亲和收益最大（用负值转成比较）→
+    # 排序后的溢出变量序列字典序最小 → 未溢出变量映射字典序最小。
+    best_key: Optional[
+        tuple[int, int, tuple[str, ...], tuple[tuple[str, str], ...]]
+    ] = None
     best_spill: Optional[set[str]] = None
     best_coloring: Optional[dict[str, str]] = None
     best_cost = 0
+    best_gain = 0
 
     # 至多 12 个变量，完整枚举 4096 个溢出集合即足够且可被测试直接对拍。
     for mask in range(1 << len(variable_ids)):
@@ -372,25 +469,29 @@ def choose_allocation(
         spill_sequence = tuple(sorted(spilled))
         spill_cost = sum(variables[variable_id]["spill_cost"] for variable_id in spilled)
 
-        # 不可能改善已找到的答案时直接跳过（第二、第三关键字仍需完整比较）。
+        # 仅溢出代价更差即可跳过：后续关键字（亲和收益、序列、映射）无法挽回。
         if best_key is not None and spill_cost > best_key[0]:
             continue
 
-        coloring = color_without_spills(variables, graph, spilled)
-        if coloring is None:
+        colored = color_without_spills(variables, graph, spilled, restrictions)
+        if colored is None:
             continue
+        coloring, affinity_gain = colored
 
-        mapping_key = tuple((variable_id, coloring[variable_id]) for variable_id in sorted(coloring))
-        key = (spill_cost, spill_sequence, mapping_key)
+        mapping_key = tuple(
+            (variable_id, coloring[variable_id]) for variable_id in sorted(coloring)
+        )
+        key = (spill_cost, -affinity_gain, spill_sequence, mapping_key)
         if best_key is None or key < best_key:
             best_key = key
             best_spill = set(spilled)
             best_coloring = coloring
             best_cost = spill_cost
+            best_gain = affinity_gain
 
-    # 全部溢出总是可行，因此下面断言对任何合法输入都成立。
+    # 全部溢出总是可行（着色为空，固定与改写约束无从冲突），断言对合法输入恒成立。
     assert best_spill is not None and best_coloring is not None
-    return best_spill, best_coloring, best_cost
+    return best_spill, best_coloring, best_cost, best_gain
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +502,10 @@ def choose_allocation(
 def allocate(program: Any) -> dict[str, Any]:
     variables, blocks, _entry = validate_program(program)
     live_in, live_out = liveness_fixed_point(variables, blocks)
-    graph = build_interference(variables, blocks, live_out)
-    spilled, coloring, spill_cost = choose_allocation(variables, graph)
+    graph, restrictions = build_interference(variables, blocks, live_out)
+    spilled, coloring, spill_cost, affinity_gain = choose_allocation(
+        variables, graph, restrictions
+    )
 
     return {
         "liveness": {
@@ -413,8 +516,15 @@ def allocate(program: Any) -> dict[str, Any]:
             for block in blocks
         },
         "interference_edges": interference_edges(graph),
+        # 每个变量需要避开的调用改写寄存器（其活跃区间跨越的全部调用点并集）。
+        "register_restrictions": {
+            variable_id: sorted(restrictions[variable_id])
+            for variable_id in sorted(variables)
+            if restrictions[variable_id]
+        },
         "spilled": sorted(spilled),
         "spill_cost": spill_cost,
+        "affinity_gain": affinity_gain,
         "allocation": {variable_id: coloring[variable_id] for variable_id in sorted(coloring)},
         "preferences": {
             variable_id: {

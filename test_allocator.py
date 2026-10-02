@@ -248,6 +248,290 @@ class AllocatorTests(unittest.TestCase):
         # 按变量 ID 取字典序最小映射：a 先取其可用集合中最小的 r0。
         self.assertEqual(result["allocation"], {"a": "r0", "b": "r1", "c": "r2"})
 
+    def test_variable_live_across_call_avoids_clobbered_register(self):
+        # a 在调用前定义、调用后仍读取，必须避开调用改写的 r5；
+        # b 在调用改写后才定义，可以使用 r5。
+        program = {
+            "variables": [
+                {"id": "a", "spill_cost": 100, "registers": ["r4", "r5"]},
+                {"id": "b", "spill_cost": 100, "registers": ["r4", "r5"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "a"},
+                        {"reads": [], "defines": "b", "clobbers": ["r5"]},
+                        {"reads": ["a", "b"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["register_restrictions"], {"a": ["r5"]})
+        self.assertEqual(result["spilled"], [])
+        self.assertEqual(result["allocation"], {"a": "r4", "b": "r5"})
+
+    def test_last_read_before_call_and_definition_after_call_ignore_clobber(self):
+        # old 在调用指令被最后一次读取（读取发生在改写前），之后死亡：允许 r0；
+        # y 在调用改写后定义：允许 r0；
+        # x 不被本指令读取、跨越调用存活：必须避开 r0（含跨块活跃）。
+        program = {
+            "variables": [
+                {"id": "old", "spill_cost": 100, "registers": ["r0", "r1"]},
+                {"id": "x", "spill_cost": 100, "registers": ["r0", "r1"]},
+                {"id": "y", "spill_cost": 100, "registers": ["r0", "r1"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "x"},
+                        {"reads": [], "defines": "old"},
+                    ],
+                    "successors": ["b1"],
+                },
+                {
+                    "id": "b1",
+                    "instructions": [
+                        {"reads": ["old"], "defines": "y", "clobbers": ["r0"]},
+                        {"reads": ["x", "y"], "defines": None},
+                    ],
+                    "successors": [],
+                },
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["register_restrictions"], {"x": ["r0"]})
+        self.assertEqual(
+            result["allocation"], {"old": "r0", "x": "r1", "y": "r0"}
+        )
+
+    def test_multiple_call_sites_union_their_clobbers(self):
+        # v 跨越两个调用点，分别改写 r0、r1，限制取并集后只能取 r2/r3。
+        program = {
+            "variables": [
+                {"id": "v", "spill_cost": 100, "registers": ["r0", "r1", "r2", "r3"]},
+                {"id": "w", "spill_cost": 100, "registers": ["r0", "r1", "r2", "r3"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "v"},
+                        {"reads": ["v"], "defines": None, "clobbers": ["r0"]},
+                        {"reads": ["v"], "defines": "w", "clobbers": ["r1"]},
+                        {"reads": ["v", "w"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["register_restrictions"], {"v": ["r0", "r1"]})
+        self.assertEqual(result["allocation"], {"v": "r2", "w": "r0"})
+
+    def test_pinned_register_is_forced_when_feasible(self):
+        # 不固定时字典序会把 p 放到 r0；固定 r1 后必须遵守。
+        program = {
+            "variables": [
+                {
+                    "id": "p", "spill_cost": 100,
+                    "registers": ["r0", "r1"],
+                    "pinned_register": "r1",
+                },
+                {"id": "q", "spill_cost": 100, "registers": ["r0", "r1"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "p"},
+                        {"reads": ["p"], "defines": "q"},
+                        {"reads": ["p", "q"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["allocation"], {"p": "r1", "q": "r0"})
+
+    def test_pinned_variable_is_spilled_when_pin_clashes_with_clobber(self):
+        # p 固定 r0，却跨越一个 clobber r0 的调用：保留它无合法着色，
+        # 只能溢出 p（而不能静默改派寄存器）。
+        program = {
+            "variables": [
+                {
+                    "id": "p", "spill_cost": 5,
+                    "registers": ["r0", "r1"],
+                    "pinned_register": "r0",
+                },
+                {"id": "q", "spill_cost": 100, "registers": ["r0", "r1"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "p"},
+                        {"reads": ["p"], "defines": "q", "clobbers": ["r0"]},
+                        {"reads": ["p", "q"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["spilled"], ["p"])
+        self.assertEqual(result["spill_cost"], 5)
+        self.assertEqual(result["allocation"], {"q": "r0"})
+
+    def test_conflicting_pins_spill_the_cheaper_variable(self):
+        # p、q 都固定 r0 且互相干涉，无法同时满足：溢出代价小的 p。
+        program = {
+            "variables": [
+                {
+                    "id": "p", "spill_cost": 5,
+                    "registers": ["r0", "r1"],
+                    "pinned_register": "r0",
+                },
+                {
+                    "id": "q", "spill_cost": 100,
+                    "registers": ["r0", "r1"],
+                    "pinned_register": "r0",
+                },
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "p"},
+                        {"reads": ["p"], "defines": "q"},
+                        {"reads": ["p", "q"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["spilled"], ["p"])
+        self.assertEqual(result["allocation"], {"q": "r0"})
+
+    def test_equal_spill_cost_prefers_higher_affinity_coloring(self):
+        # 干涉边只有 b-x；y 孤立，b 带权 10 亲和 y。
+        # 寄存器域经刻意选取：纯字典序解 b=r0、x=r1、y=r1，b 与 y 不同色（收益 0）；
+        # 亲和最优解 b=r2、x=r0、y=r2（收益 10），它在旧规则下因映射字典序更大落选。
+        program = {
+            "variables": [
+                {
+                    "id": "b", "spill_cost": 1, "registers": ["r0", "r2"],
+                    "prefer_same_as": "y", "affinity_weight": 10,
+                },
+                {"id": "x", "spill_cost": 1, "registers": ["r0", "r1"]},
+                {"id": "y", "spill_cost": 1, "registers": ["r1", "r2"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "x"},
+                        {"reads": ["x"], "defines": "b"},
+                        {"reads": ["b", "x"], "defines": None},
+                        {"reads": ["b"], "defines": None},
+                        {"reads": [], "defines": "y"},
+                        {"reads": ["y"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["interference_edges"], [["b", "x"]])
+        self.assertEqual(result["spilled"], [])
+        self.assertEqual(result["affinity_gain"], 10)
+        self.assertEqual(result["allocation"], {"b": "r2", "x": "r0", "y": "r2"})
+
+    def test_affinity_breaks_ties_between_equal_cost_spill_sets(self):
+        # a、b、c 成三角形且只有两个寄存器，恰好溢出一个；d 孤立。
+        # c 带权 7 亲和 d：溢出 a 或 b 保留 c 可得收益 7，溢出 c 收益 0；
+        # 收益相同时再按溢出序列字典序 → 溢出 a。
+        program = {
+            "variables": [
+                {"id": "a", "spill_cost": 1, "registers": ["r0", "r1"]},
+                {"id": "b", "spill_cost": 1, "registers": ["r0", "r1"]},
+                {
+                    "id": "c", "spill_cost": 1, "registers": ["r0", "r1"],
+                    "prefer_same_as": "d", "affinity_weight": 7,
+                },
+                {"id": "d", "spill_cost": 1, "registers": ["r0", "r1"]},
+            ],
+            "blocks": [
+                {
+                    "id": "b0",
+                    "instructions": [
+                        {"reads": [], "defines": "a"},
+                        {"reads": ["a"], "defines": "b"},
+                        {"reads": ["a", "b"], "defines": "c"},
+                        {"reads": ["a", "b", "c"], "defines": None},
+                        {"reads": [], "defines": "d"},
+                        {"reads": ["d"], "defines": None},
+                    ],
+                    "successors": [],
+                }
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["spilled"], ["a"])
+        self.assertEqual(result["spill_cost"], 1)
+        self.assertEqual(result["affinity_gain"], 7)
+        self.assertEqual(result["allocation"], {"b": "r0", "c": "r1", "d": "r1"})
+
+    def test_call_clobber_in_loop_body_protects_live_loop_variable(self):
+        # x 带着循环回边存活，循环体含 clobber r1 的调用：x 必须固定在 r0，
+        # 且该结论由数据流不动点驱动（x 的活跃跨越回边）。
+        program = {
+            "variables": [
+                {"id": "x", "spill_cost": 100, "registers": ["r0", "r1"]},
+                {"id": "t", "spill_cost": 100, "registers": ["r0", "r1"]},
+            ],
+            "blocks": [
+                {
+                    "id": "entry",
+                    "instructions": [{"reads": [], "defines": "x"}],
+                    "successors": ["loop"],
+                },
+                {
+                    "id": "loop",
+                    "instructions": [
+                        # x 在调用前定义点之外存活、调用后仍被读取与重定义。
+                        {"reads": [], "defines": "t", "clobbers": ["r1"]},
+                        {"reads": ["x", "t"], "defines": None},
+                        {"reads": ["x"], "defines": "x"},
+                    ],
+                    "successors": ["after", "loop"],
+                },
+                {
+                    "id": "after",
+                    "instructions": [{"reads": ["x"], "defines": None}],
+                    "successors": [],
+                },
+            ],
+        }
+
+        result = allocate(program)
+        self.assertEqual(result["register_restrictions"], {"x": ["r1"]})
+        self.assertEqual(result["spilled"], [])
+        self.assertEqual(result["allocation"]["x"], "r0")
+
     def test_reject_unknown_variables_illegal_successors_and_duplicate_blocks(self):
         valid_variable = {
             "id": "a",
